@@ -1,0 +1,21 @@
+#!/bin/bash
+
+if [ -z $UID -o $UID -gt 0 ]; then
+    echo "via-mullvad must be run as root"
+    exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1 ; then
+    echo "curl not found: curl must be available"
+    exit 1
+fi
+
+# Establish keypair
+wg genkey | tee $HOME/mullvad-private-key | wg pubkey > $HOME/mullvad-public-key
+
+# Establish mullvad device registered pubkey
+
+
+# Establish wireguard network info, IP of peer and such
+# Call via-wireguard specifying keypair
+# Handle check if specified

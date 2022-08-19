@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Establish netns
+# Establish veth pair
+# Add peer to netns
+# Give peer some local IP range 172...
+# Bring peer UP
+# Add wg link in netns
+# Set wg link UP
+
+if [ -z $UID -o $UID -gt 0 ]; then
+    echo "via-wireguard must be run as root"
+    exit 1
+fi
+
+suffixNum=0
+nsName=viawg$suffixNum
+while [[ $(ip netns list) == *"$nsName"* ]]; do
+    let suffixNum++
+    nsName=viawg$suffixNum
+done
+
+ip netns add $nsName
