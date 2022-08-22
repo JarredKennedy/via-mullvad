@@ -1,20 +1,73 @@
 #!/bin/bash
 
+viamv_usage () {
+    echo "Usage:"
+    echo "via-mullvad -a account_number -- program [program_args]"
+    echo "Note: double dash (--) is NOT optional when program is required (ie unless using --check-only)"
+}
+
+if [ $# -lt 1 ]; then
+    echo "Too few arguments"
+    echo
+    viamv_usage
+    exit 1
+fi
+
 if [ -z $UID -o $UID -gt 0 ]; then
     echo "via-mullvad must be run as root"
     exit 1
 fi
 
-if ! command -v curl >/dev/null 2>&1 ; then
+if ! command -v wg >/dev/null 2>&1; then
+    echo "wg not found: wireguard-tools must be available"
+    exit 1
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
     echo "curl not found: curl must be available"
     exit 1
 fi
 
+account_number=$1
+
 # Establish keypair
-wg genkey | tee $HOME/mullvad-private-key | wg pubkey > $HOME/mullvad-public-key
+pub_key=$(wg genkey | tee $HOME/mullvad-private-key | wg pubkey | tee $HOME/mullvad-public-key)
+
+# $1    endpoint
+# $2    data
+# $3    response variable
+# $4    access token (optional)
+viamv_api_request () {
+    headers=(-H "Content-Type: application/json")
+    headers+=(-H "Accept: application/json")
+
+    if [ $# -eq 4 ]; then
+        headers+=(-H "Authorization: Bearer $4")
+    fi
+
+    local response=$(curl -sS -d $2 "${headers[@]}" https://api.mullvad.net/$1)
+
+    declare -g $3="$response"
+}
+
+viamv_api_request "auth/v1/token" "{\"account_number\":\"$account_number\"}" "token_response"
+access_token=$(echo $token_response | grep -o -e "\"access_token\":\"[^\"]*" | cut -b 17-)
+
+# Check if the access token is obviously not what is expected.
+# The access token is invalid if it is fewer than 10 chars or is not case-insensitive alpha-numeric + underscore.
+if [ ${#access_token} -lt 10 -o $(echo -n $access_token | grep -o -e "^[a-zA-Z0-9_]*$" | tr -d '\n' | wc -c) -ne ${#access_token} ]; then
+    echo "Access token is not in the correct format."
+    echo "HTTP request may have failed. Check account_number parameter is correct."
+    exit 1
+fi
+
+echo $access_token
+echo $pub_key
 
 # Establish mullvad device registered pubkey
+viamv_api_request "accounts/v1/devices" "{\"pubkey\":\"$pub_key\",\"hijack_dns\":false}" "devices_response" $access_token
 
+echo "$devices_response"
 
 # Establish wireguard network info, IP of peer and such
 # Call via-wireguard specifying keypair
