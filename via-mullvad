@@ -2,14 +2,64 @@
 
 viamv_usage () {
     echo "Usage:"
-    echo "via-mullvad -a account_number -- program [program_args]"
+    echo "via-mullvad -a acccount_number [OPTIONS...] [-- program [program_args]]"
+    echo
+    echo "SYNOPSIS"
+    echo -e "\tvia-mullvad -a 12345689 -- curl https://am.i.mullvad.net/connected"
+    echo
+    echo -e "OPTIONS"
+
+    echo -e "\t-a account_number"
+    echo -e "\t\tSpecifies the Mullvad account number. This argument is required."
+
+    echo -e "\t-h hostname"
+    echo -e "\t\tSpecifies the hostname of the Mullvad server to connect to. If no hostname is specified, the locale command is used to determine the"
+    echo -e "\t\tcountry and any wireguard server in that country may be used. The value of hostname can be a location in the format {country code}-{city}"
+    echo -e "\t\twith values used by Mullvad, for example, au-syd for Sydney, Australia."
+
+    echo -e "\t--no-cache"
+    echo -e "\t\tDoes not use any mullvad device, keys, relay data, access token, etc from a previous execution of this via-mullvad or via-wireguard."
+    echo -e "\t\tvia-mullvad will also not cache any data with this option enabled."
+
+    echo -e "\t-c, --check"
+    echo -e "\t\tChecks that the Mullvad VPN connection is working. If the Mullvad VPN connection cannot be confirmed, the program displays an error message,"
+    echo -e "\t\texits with exit code 1 and does not execute the executable."
+
     echo "Note: double dash (--) is NOT optional when program is required (ie unless using --check-only)"
+    echo
+    echo "EXAMPLES"
+    echo -e "\tPing github.com from Germany"
+    echo -e "\tvia-mullvad -a 123456789 -h de10-wireguard -- ping github.com"
+    echo
+    echo -e "\tExecute a program with networking via Singapore"
+    echo -e "\tvia-mullvad -a 123456789 -h sg4-wireguard -- /usr/local/bin/my-program arg1 arg2"
 }
 
-if [ $# -lt 1 ]; then
-    echo "Too few arguments"
-    echo
-    viamv_usage
+arg_offset=1
+while [ $arg_offset -le $# ]
+do
+    arg_span=1
+    arg="${!arg_offset}"
+
+    if [[ $arg == "-a" ]]; then
+        let accno_arg=$arg_offset+1
+        account_number=${!accno_arg}
+        arg_span=2
+    elif [[ $arg == "-h" ]]; then
+        let host_arg=$arg_offset+1
+        host_name=${!host_arg}
+        arg_span=2
+    elif [[ $arg == "--help" ]]; then
+        viamv_usage
+        exit 0
+    fi
+
+    let arg_offset=$arg_offset+$arg_span
+done
+
+if [ -z "$account_number" -o $(echo "$account_number" | grep -o -e "^[0-9]*$" | tr -d '\n' | wc -c) -ne ${#account_number} ]; then
+    echo "Invalid argument: -a account_number"
+    echo "argument is required and must be only contain digits"
     exit 1
 fi
 
@@ -27,8 +77,6 @@ if ! command -v curl >/dev/null 2>&1; then
     echo "curl not found: curl must be available"
     exit 1
 fi
-
-account_number=$1
 
 # Establish keypair
 pub_key=$(wg genkey | tee $HOME/mullvad-private-key | wg pubkey | tee $HOME/mullvad-public-key)
@@ -49,6 +97,66 @@ viamv_api_request () {
 
     declare -g $3="$response"
 }
+
+relays_url="https://api.mullvad.net/app/v1/relays"
+relays_headers=$(curl -sS --head "$relays_url")
+
+relays_etag_line=$(echo "$relays_headers" | grep -m 1 -e "^etag:")
+relays_etag=$(echo "$relays_etag_line" | grep -o -e "\"[^\"]*" | tr -d '\r\n"')
+relays_file="$HOME/relays-$relays_etag.json"
+
+if [ -n "$relays_etag" -a -f $relays_file ]; then
+    echo "Read relay data from file"
+    relays_data=$(cat $relays_file)
+else
+    echo "Downloaded relay data"
+    relays_data=$(curl -sS "$relays_url" | tee $relays_file)
+fi
+
+if [ -n "$host_name"  ] && echo "$host_name" | grep -q -e "-wireguard"; then
+    # If the hostname was specified, and the hostname is not a location, try to find
+    # the specified relay in the relay data.
+    relay=$(echo "$relays_data" | awk "/\\\"wireguard\\\"/ { match(\$0, /\\\"wireguard\\\":[^\\\"]+\\\"relays\\\":/); wg=substr(\$0, RSTART+RLENGTH); match(wg, /{[^\}]*\\\"hostname\\\":\\\"$host_name\\\"[^}]*}/); relay=substr(wg, RSTART, RLENGTH); print relay }")
+
+    if [ -z "$relay" ]; then
+        echo "Could not find relay with hostname $host_name"
+        exit 1
+    fi
+else
+    # If the hostname is a location, try to find a wireguard server matching that location. If
+    # the hostname was omitted, use a server matching the country specified by locale.
+    # If there is no Mullvad wireguard server matching the location specified, exit with error.
+    # If there is no Mullvad wireguard server matching the output of locale, use US.
+    if [ -n "$host_name" ]; then
+        if echo "$host_name" | grep -q -e "^[a-z]\{2\}\(-[a-z]\{3\}\)\?$"; then
+            # hostname is a location in one of these formats: CC or CC-YYY
+            location="$host_name"
+        else
+            echo "Hostname argument is not in ({country code}[-{city abbr}]) format $host_name"
+            exit 1
+        fi
+    else
+        location=$(locale | grep -e "LANGUAGE=" | grep -o -e "[a-z]\{2\}_[A-Z]\{2\}" | cut -c 4- | tr [:upper:] [:lower:])
+    fi
+
+    match_location="/\\\"wireguard\\\"/ { match(\$0, /\\\"wireguard\\\":[^\\\"]+\\\"relays\\\":/); wg=substr(\$0, RSTART+RLENGTH); match(wg, /{[^\}]*\\\"location\\\":\\\"LOCATION(-[a-z][a-z][a-z])?\\\"[^}]*}/); relay=substr(wg, RSTART, RLENGTH); print relay }"
+
+    program=$(echo -n "$match_location" | sed s/LOCATION/$location/)
+    relay=$(echo "$relays_data" | awk "$program")
+
+    if [ -z "$relay" ]; then
+        if [ -n "$host_name" ]; then
+            echo "Could not find a relay matching location $host_name"
+            exit 1
+        else
+            program=$(echo -n "$match_location" | sed s/LOCATION/us/)
+            relay=$(echo "$relays_data" | awk "$program")
+        fi
+    fi
+fi
+
+echo "$relay"
+exit
 
 viamv_api_request "auth/v1/token" "{\"account_number\":\"$account_number\"}" "token_response"
 access_token=$(echo $token_response | grep -o -e "\"access_token\":\"[^\"]*" | cut -b 17-)
