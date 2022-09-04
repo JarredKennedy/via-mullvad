@@ -4,9 +4,6 @@ viamv_usage () {
     echo "Usage:"
     echo "via-mullvad -a acccount_number [OPTIONS...] [-- program [program_args]]"
     echo
-    echo "SYNOPSIS"
-    echo -e "\tvia-mullvad -a 12345689 -- curl https://am.i.mullvad.net/connected"
-    echo
     echo -e "OPTIONS"
 
     echo -e "\t-a account_number"
@@ -49,6 +46,11 @@ do
         let host_arg=$arg_offset+1
         host_name=${!host_arg}
         arg_span=2
+    elif [[ $arg == "--" ]]; then
+        all_args=( ${*} )
+        num_program_args=(${#all_args[@]}-$arg_offset)
+        program=${all_args[@]:$arg_offset:num_program_args}
+        break
     elif [[ $arg == "--help" ]]; then
         viamv_usage
         exit 0
@@ -155,9 +157,6 @@ else
     fi
 fi
 
-echo "$relay"
-exit
-
 viamv_api_request "auth/v1/token" "{\"account_number\":\"$account_number\"}" "token_response"
 access_token=$(echo $token_response | grep -o -e "\"access_token\":\"[^\"]*" | cut -b 17-)
 
@@ -177,6 +176,6 @@ viamv_api_request "accounts/v1/devices" "{\"pubkey\":\"$pub_key\",\"hijack_dns\"
 
 echo "$devices_response"
 
-# Establish wireguard network info, IP of peer and such
-# Call via-wireguard specifying keypair
-# Handle check if specified
+if ($check_enabled); then
+    check_result=$(/bin/bash ./via-wireguard --keep -- curl https://am.i.mullvad.net/connected)
+fi
