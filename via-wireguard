@@ -1,5 +1,129 @@
 #!/bin/bash
 
+viawg_usage () {
+    echo "Usage:"
+    echo "via-wireguard endpoint private_key_file peer_key [OPTIONS...] [-- program [program_args...]]"
+    echo
+
+    echo -e "endpoint"
+    echo -e "\tThe IP address and port of the wireguard endpoint. This is required and is always the first argument."
+    echo -e "private_key_file"
+    echo -e "\tPath to a file containing the private key for the wireguard interface. This is required and is always the second argument."
+    echo -e "peer_key"
+    echo -e "\tBase64 representation of the wireguard peer public key. This is required and is always the third argument."
+    echo
+
+    echo "OPTIONS"
+    echo -e "\t-i ip_address"
+    echo -e "\t\tIP address to assign to the wireguard link."
+    echo -e "\t-k"
+    echo -e "\t\tKeep the namespace, wireguard link, etc after the script exits. Use this to use the same resources for a subsequent"
+    echo -e "\t\tvia-wireguard invocation. By default the namespace is deleted before the script exits."
+    echo -e "\t-d"
+    echo -e "\t\tDelete any resources matching the endpoint, private_key_file and peer_key. Use this to clean up after a previous via-wireguard"
+    echo -e "\t\tinvocation with the -k argument."
+}
+
+arg_offset=1
+while [ $arg_offset -le $# ]
+do
+    arg_span=1
+    arg="${!arg_offset}"
+
+    if [ $arg_offset -eq 1 ]; then
+        if echo $1 | grep -q -e "^[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}:[0-9]\{1,5\}$"; then
+            endpoint="$1"
+        else
+            echo "Endpoint argument is not in {IP v4}:{port} format."
+            exit 1
+        fi
+    elif [ $arg_offset -eq 2 ]; then
+        if [ -f "$2" ]; then
+            private_key_file="$2"
+        else
+            echo "Private key file not found."
+            exit 1
+        fi
+    elif [ $arg_offset -eq 3 ]; then
+        if echo $3 | grep -q -e "^[a-zA-Z0-9/=+]\+$"; then
+            peer_key="$3"
+        else
+            echo "Peer key is not in base64 format."
+            exit 1
+        fi
+    elif [[ $arg == "-a" ]]; then
+        let accno_arg=$arg_offset+1
+        account_number=${!accno_arg}
+        arg_span=2
+    elif [[ $arg == "-h" ]]; then
+        let host_arg=$arg_offset+1
+        host_name=${!host_arg}
+        arg_span=2
+    elif [[ $arg == "-d" ]]; then
+        is_delete=1
+    elif [[ $arg == "-k" ]]; then
+        keep_resources=1
+    elif [[ $arg == "--" ]]; then
+        all_args=( ${*} )
+        num_program_args=(${#all_args[@]}-$arg_offset)
+        program=${all_args[@]:$arg_offset:num_program_args}
+        break
+    elif [[ $arg == "--help" ]]; then
+        viamv_usage
+        exit 0
+    fi
+
+    let arg_offset=$arg_offset+$arg_span
+done
+
+# CRC32
+# $1    String to hash
+# $2    Name of variable to assign hash to
+hash_string () {
+    if [ -z "$crctable" ]; then
+        crctable=(0)
+
+        i=0
+        while [ $i -lt 256 ]; do
+            rem=$i
+            j=0
+            while [ $j -lt 8 ]; do
+                if [ $(( $rem & 1 )) -gt 0 ]; then
+                    rem=$(( $rem >> 1 ))
+                    rem=$(( $rem ^ 0xEDB88320 ))
+                else
+                    rem=$(( $rem >> 1 ))
+                fi
+
+                crctable[$i]=$rem
+
+                j=$(($j+1))
+            done
+
+            i=$(($i+1))
+        done
+
+    fi
+
+    checksum=$((~ 0))
+    byte_offset=1
+    while [ $byte_offset -le ${#1} ]; do
+        byte=$(echo -n "$1" | cut -z -b $byte_offset | od -t u1 -A n -w1 | tr -d ' ' | sed '1q;d')
+        value_index=$(( ( $checksum & 0xFF ) ^ $byte ))
+        checksum=$(( ( $checksum >> 8 ) ^ ${crctable[$value_index]} ))
+        byte_offset=$(( $byte_offset + 1 ))
+    done
+
+    checksum=$((~ $checksum))
+
+    declare -g $2=$(printf "%X" $checksum)
+}
+
+hash_string "$endpoint\\$private_key_file\\$peer_key" "instance"
+
+echo $instance
+exit
+
 # Establish netns
 # Establish veth pair
 # Add peer to netns
@@ -13,11 +137,33 @@ if [ -z $UID -o $UID -gt 0 ]; then
     exit 1
 fi
 
-suffixNum=0
-nsName=viawg$suffixNum
-while [[ $(ip netns list) == *"$nsName"* ]]; do
-    let suffixNum++
-    nsName=viawg$suffixNum
-done
+if ! command -v wg >/dev/null 2>&1; then
+    echo "wg not found: wireguard-tools must be available"
+    exit 1
+fi
 
-ip netns add $nsName
+ip netns add viawg
+
+ip link add viawg-veth0 type veth peer name eth0 netns viawg
+ip link add viawg-br0 type bridge
+
+ip -n viawg link set lo up
+ip link set viawg-veth0 up
+ip -n viawg link set eth0 up
+ip link set viawg-br0 up
+
+ip addr add 172.29.29.1/24 dev viawg-br0
+ip -n viawg addr add 172.29.29.2/24 dev eth0
+
+ip link set viawg-veth0 master viawg-br0
+
+ip route add 172.29.29.0/24 dev viawg-br0
+# The IP assignment will do this automatically
+# ip -n viawg route add 172.29.29.0/24 dev eth0 scope link src 172.29.29.2
+ip -n viawg route add default via 172.29.29.1 dev eth0
+
+iptables -A FORWARD -i viawg-br0 -j ACCEPT
+iptables -A FORWARD -o viawg-br0 -j ACCEPT
+iptables -t nat -A POSTROUTING -s 172.29.29.0/24 ! -o viawg-br0 -j MASQUERADE
+
+ip netns exec viawg "$program"

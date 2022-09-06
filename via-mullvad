@@ -2,19 +2,20 @@
 
 viamv_usage () {
     echo "Usage:"
-    echo "via-mullvad -a acccount_number [OPTIONS...] [-- program [program_args]]"
+    echo "via-mullvad acccount_number [OPTIONS...] -- program [program_args]"
     echo
+    
+    echo -e "account_number"
+    echo -e "\tSpecifies the Mullvad account number. This argument is required."
+    echo
+
     echo -e "OPTIONS"
-
-    echo -e "\t-a account_number"
-    echo -e "\t\tSpecifies the Mullvad account number. This argument is required."
-
     echo -e "\t-h hostname"
     echo -e "\t\tSpecifies the hostname of the Mullvad server to connect to. If no hostname is specified, the locale command is used to determine the"
     echo -e "\t\tcountry and any wireguard server in that country may be used. The value of hostname can be a location in the format {country code}-{city}"
     echo -e "\t\twith values used by Mullvad, for example, au-syd for Sydney, Australia."
 
-    echo -e "\t--no-cache"
+    echo -e "\t-C, --no-cache"
     echo -e "\t\tDoes not use any mullvad device, keys, relay data, access token, etc from a previous execution of this via-mullvad or via-wireguard."
     echo -e "\t\tvia-mullvad will also not cache any data with this option enabled."
 
@@ -22,7 +23,7 @@ viamv_usage () {
     echo -e "\t\tChecks that the Mullvad VPN connection is working. If the Mullvad VPN connection cannot be confirmed, the program displays an error message,"
     echo -e "\t\texits with exit code 1 and does not execute the executable."
 
-    echo "Note: double dash (--) is NOT optional when program is required (ie unless using --check-only)"
+    echo "Note: double dash (--) before program is NOT optional."
     echo
     echo "EXAMPLES"
     echo -e "\tPing github.com from Germany"
@@ -32,20 +33,22 @@ viamv_usage () {
     echo -e "\tvia-mullvad -a 123456789 -h sg4-wireguard -- /usr/local/bin/my-program arg1 arg2"
 }
 
+check_enabled=0
+
 arg_offset=1
 while [ $arg_offset -le $# ]
 do
     arg_span=1
     arg="${!arg_offset}"
 
-    if [[ $arg == "-a" ]]; then
-        let accno_arg=$arg_offset+1
-        account_number=${!accno_arg}
-        arg_span=2
+    if [ $arg_offset -eq 1 ]]; then
+        account_number=$1
     elif [[ $arg == "-h" ]]; then
         let host_arg=$arg_offset+1
         host_name=${!host_arg}
         arg_span=2
+    elif [[ $arg == "--check" ]]; then
+        check_enabled=1
     elif [[ $arg == "--" ]]; then
         all_args=( ${*} )
         num_program_args=(${#all_args[@]}-$arg_offset)
@@ -143,16 +146,16 @@ else
 
     match_location="/\\\"wireguard\\\"/ { match(\$0, /\\\"wireguard\\\":[^\\\"]+\\\"relays\\\":/); wg=substr(\$0, RSTART+RLENGTH); match(wg, /{[^\}]*\\\"location\\\":\\\"LOCATION(-[a-z][a-z][a-z])?\\\"[^}]*}/); relay=substr(wg, RSTART, RLENGTH); print relay }"
 
-    program=$(echo -n "$match_location" | sed s/LOCATION/$location/)
-    relay=$(echo "$relays_data" | awk "$program")
+    location_program=$(echo -n "$match_location" | sed s/LOCATION/$location/)
+    relay=$(echo "$relays_data" | awk "$location_program")
 
     if [ -z "$relay" ]; then
         if [ -n "$host_name" ]; then
             echo "Could not find a relay matching location $host_name"
             exit 1
         else
-            program=$(echo -n "$match_location" | sed s/LOCATION/us/)
-            relay=$(echo "$relays_data" | awk "$program")
+            location_program=$(echo -n "$match_location" | sed s/LOCATION/us/)
+            relay=$(echo "$relays_data" | awk "$location_program")
         fi
     fi
 fi
@@ -177,5 +180,7 @@ viamv_api_request "accounts/v1/devices" "{\"pubkey\":\"$pub_key\",\"hijack_dns\"
 echo "$devices_response"
 
 if ($check_enabled); then
-    check_result=$(/bin/bash ./via-wireguard --keep -- curl https://am.i.mullvad.net/connected)
+    check_result=$(/bin/bash ./via-wireguard -k -- curl https://am.i.mullvad.net/connected)
 fi
+
+/bin/bash ./via-wireguard -- "$program"
