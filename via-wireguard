@@ -19,10 +19,19 @@ viawg_usage () {
     echo -e "\t-k"
     echo -e "\t\tKeep the namespace, wireguard link, etc after the script exits. Use this to use the same resources for a subsequent"
     echo -e "\t\tvia-wireguard invocation. By default the namespace is deleted before the script exits."
+    echo -e "\t-r nameserver"
+    echo -e "\t\tUse the specified nameserver for DNS. Without this argument, the network namespace will use the host's resolv.conf. If the"
+    echo -e "\t\thost is using systemd-resolved or anything else requiring access to a DNS resolver bound to the host, DNS will not work"
+    echo -e "\t\tbecause the namespace has its own routing table with a route for 127.0.0.1 so it cannot access the host at 127.0.0.1."
     echo -e "\t-d"
     echo -e "\t\tDelete any resources matching the endpoint, private_key_file and peer_key. Use this to clean up after a previous via-wireguard"
     echo -e "\t\tinvocation with the -k argument."
 }
+
+if ! command -v wg >/dev/null 2>&1; then
+    echo "wg not found: wireguard-tools must be available"
+    exit 1
+fi
 
 arg_offset=1
 while [ $arg_offset -le $# ]
@@ -30,7 +39,10 @@ do
     arg_span=1
     arg="${!arg_offset}"
 
-    if [ $arg_offset -eq 1 ]; then
+    if [[ $arg == "--help" ]]; then
+        viawg_usage
+        exit 0
+    elif [ $arg_offset -eq 1 ]; then
         if echo $1 | grep -q -e "^[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}:[0-9]\{1,5\}$"; then
             endpoint="$1"
         else
@@ -51,30 +63,44 @@ do
             echo "Peer key is not in base64 format."
             exit 1
         fi
-    elif [[ $arg == "-a" ]]; then
-        let accno_arg=$arg_offset+1
-        account_number=${!accno_arg}
-        arg_span=2
-    elif [[ $arg == "-h" ]]; then
-        let host_arg=$arg_offset+1
-        host_name=${!host_arg}
-        arg_span=2
     elif [[ $arg == "-d" ]]; then
         is_delete=1
     elif [[ $arg == "-k" ]]; then
-        keep_resources=1
+        keep_namespace=1
+    elif [[ $arg == "-i" ]]; then
+        let ip_arg=$arg_offset+1
+        ip_address=${!ip_arg}
+        arg_span=2
+    elif [[ $arg == "-r" ]]; then
+        let ns_arg=$arg_offset+1
+        nameserver=${!ns_arg}
+        arg_span=2
     elif [[ $arg == "--" ]]; then
         all_args=( ${*} )
         num_program_args=(${#all_args[@]}-$arg_offset)
         program=${all_args[@]:$arg_offset:num_program_args}
         break
-    elif [[ $arg == "--help" ]]; then
-        viamv_usage
-        exit 0
     fi
 
     let arg_offset=$arg_offset+$arg_span
 done
+
+# Root check after processing arguments to not require root for --help
+if [ -z $UID -o $UID -gt 0 ]; then
+    echo "via-wireguard must be run as root"
+    exit 1
+fi
+
+if [ -z "$endpoint" ]; then
+    echo "endpoint argument is required."
+    exit 1
+elif [ -z "$private_key_file" ]; then
+    echo "private_key_file argument is required."
+    exit 1
+elif [ -z "$peer_key" ]; then
+    echo "peer_key argument is required."
+    exit 1
+fi
 
 # CRC32
 # $1    String to hash
@@ -120,9 +146,26 @@ hash_string () {
 }
 
 hash_string "$endpoint\\$private_key_file\\$peer_key" "instance"
+instance=${instance:0:6}
 
-echo $instance
-exit
+namespace="vwg$instance"
+
+delete_resources () {
+    ip netns delete $namespace
+    ip link delete "$namespace-br0"
+    iptables -D FORWARD -i "$namespace-br0" -j ACCEPT
+    iptables -D FORWARD -o "$namespace-br0" -j ACCEPT
+    iptables -t nat -D POSTROUTING -s 172.29.29.0/24 ! -o "$namespace-br0" -j MASQUERADE
+    rm -rf /etc/netns/$namespace
+}
+
+if [ -n "$is_delete" ]; then
+    delete_resources
+    exit 0
+elif [ -z "$program" ]; then
+    echo "program must be specified unless using -d"
+    exit 1
+fi
 
 # Establish netns
 # Establish veth pair
@@ -132,38 +175,54 @@ exit
 # Add wg link in netns
 # Set wg link UP
 
-if [ -z $UID -o $UID -gt 0 ]; then
-    echo "via-wireguard must be run as root"
-    exit 1
+ip netns add $namespace
+
+if [ -n "$nameserver" ]; then
+    if [ ! -d /etc/netns/$namespace ]; then
+        mkdir -p /etc/netns/$namespace
+    fi
+
+    # This file will be bind mounted to /etc/resolv.conf for the process executed by ip netns exec.
+    echo "nameserver $nameserver" > /etc/netns/$namespace/resolv.conf
 fi
 
-if ! command -v wg >/dev/null 2>&1; then
-    echo "wg not found: wireguard-tools must be available"
-    exit 1
+ip link add "$namespace-v0" type veth peer name eth0 netns $namespace
+ip link add "$namespace-br0" type bridge
+
+ip -n $namespace link set lo up
+ip link set "$namespace-v0" up
+ip -n $namespace link set eth0 up
+ip link set "$namespace-br0" up
+
+ip addr add 172.29.29.1/24 dev "$namespace-br0"
+ip -n $namespace addr add 172.29.29.2/24 dev eth0
+
+ip link set "$namespace-v0" master "$namespace-br0"
+
+ip -n $namespace route add default via 172.29.29.1 dev eth0
+ip route add 172.29.29.0/24 dev "$namespace-br0"
+
+ip -n $namespace link add dev wg0 type wireguard
+
+if [ -n "$ip_address" ]; then
+    ip -n $namespace addr add $ip_address dev wg0
 fi
 
-ip netns add viawg
+fwmark="0x63617274"
+table="1667330676"
 
-ip link add viawg-veth0 type veth peer name eth0 netns viawg
-ip link add viawg-br0 type bridge
+ip netns exec $namespace wg set wg0 fwmark "$fwmark" private-key "$private_key_file" peer "$peer_key" endpoint "$endpoint" allowed-ips 0.0.0.0/0
+ip -n $namespace link set wg0 up
 
-ip -n viawg link set lo up
-ip link set viawg-veth0 up
-ip -n viawg link set eth0 up
-ip link set viawg-br0 up
+ip -n $namespace rule add not from all fwmark "$fwmark" priority 32765 table "$table"
+ip -n $namespace route add table "$table" default dev wg0 proto static
 
-ip addr add 172.29.29.1/24 dev viawg-br0
-ip -n viawg addr add 172.29.29.2/24 dev eth0
+iptables -A FORWARD -i "$namespace-br0" -j ACCEPT
+iptables -A FORWARD -o "$namespace-br0" -j ACCEPT
+iptables -t nat -A POSTROUTING -s 172.29.29.0/24 ! -o "$namespace-br0" -j MASQUERADE
 
-ip link set viawg-veth0 master viawg-br0
+ip netns exec $namespace $program
 
-ip route add 172.29.29.0/24 dev viawg-br0
-# The IP assignment will do this automatically
-# ip -n viawg route add 172.29.29.0/24 dev eth0 scope link src 172.29.29.2
-ip -n viawg route add default via 172.29.29.1 dev eth0
-
-iptables -A FORWARD -i viawg-br0 -j ACCEPT
-iptables -A FORWARD -o viawg-br0 -j ACCEPT
-iptables -t nat -A POSTROUTING -s 172.29.29.0/24 ! -o viawg-br0 -j MASQUERADE
-
-ip netns exec viawg "$program"
+if [ -z "$keep_namespace" ]; then
+    delete_resources
+fi

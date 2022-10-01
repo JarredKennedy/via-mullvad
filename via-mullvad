@@ -6,7 +6,7 @@ viamv_usage () {
     echo
     
     echo -e "account_number"
-    echo -e "\tSpecifies the Mullvad account number. This argument is required."
+    echo -e "\tThe Mullvad account number. This argument is required."
     echo
 
     echo -e "OPTIONS"
@@ -15,25 +15,21 @@ viamv_usage () {
     echo -e "\t\tcountry and any wireguard server in that country may be used. The value of hostname can be a location in the format {country code}-{city}"
     echo -e "\t\twith values used by Mullvad, for example, au-syd for Sydney, Australia."
 
-    echo -e "\t-C, --no-cache"
-    echo -e "\t\tDoes not use any mullvad device, keys, relay data, access token, etc from a previous execution of this via-mullvad or via-wireguard."
-    echo -e "\t\tvia-mullvad will also not cache any data with this option enabled."
+    echo -e "\t-r nameserver"
+    echo -e "\t\tUses the nameserver in the argument for DNS lookups."
 
-    echo -e "\t-c, --check"
-    echo -e "\t\tChecks that the Mullvad VPN connection is working. If the Mullvad VPN connection cannot be confirmed, the program displays an error message,"
-    echo -e "\t\texits with exit code 1 and does not execute the executable."
+    echo -e "\t-f"
+    echo -e "\t\tAllow the script to delete the oldest Mullvad device if the account already has the maximum number of accounts registered."
 
     echo "Note: double dash (--) before program is NOT optional."
     echo
     echo "EXAMPLES"
     echo -e "\tPing github.com from Germany"
-    echo -e "\tvia-mullvad -a 123456789 -h de10-wireguard -- ping github.com"
+    echo -e "\tvia-mullvad 123456789 -h de10-wireguard -- ping github.com"
     echo
     echo -e "\tExecute a program with networking via Singapore"
-    echo -e "\tvia-mullvad -a 123456789 -h sg4-wireguard -- /usr/local/bin/my-program arg1 arg2"
+    echo -e "\tvia-mullvad 123456789 -h sg4-wireguard -- /usr/local/bin/my-program arg1 arg2"
 }
-
-check_enabled=0
 
 arg_offset=1
 while [ $arg_offset -le $# ]
@@ -41,7 +37,7 @@ do
     arg_span=1
     arg="${!arg_offset}"
 
-    if [ $arg_offset -eq 1 ]]; then
+    if [ $arg_offset -eq 1 ]; then
         account_number=$1
     elif [[ $arg == "-h" ]]; then
         let host_arg=$arg_offset+1
@@ -49,6 +45,12 @@ do
         arg_span=2
     elif [[ $arg == "--check" ]]; then
         check_enabled=1
+    elif [[ $arg == '-r' ]]; then
+        let ns_arg=$arg_offset+1
+        nameserver=${!ns_arg}
+        arg_span=2
+    elif [[ $arg == '-f' ]]; then
+        allow_delete_device=1
     elif [[ $arg == "--" ]]; then
         all_args=( ${*} )
         num_program_args=(${#all_args[@]}-$arg_offset)
@@ -63,7 +65,7 @@ do
 done
 
 if [ -z "$account_number" -o $(echo "$account_number" | grep -o -e "^[0-9]*$" | tr -d '\n' | wc -c) -ne ${#account_number} ]; then
-    echo "Invalid argument: -a account_number"
+    echo "Invalid argument: account_number"
     echo "argument is required and must be only contain digits"
     exit 1
 fi
@@ -83,11 +85,13 @@ if ! command -v curl >/dev/null 2>&1; then
     exit 1
 fi
 
+cache_dir="$HOME"
+
 # Establish keypair
-pub_key=$(wg genkey | tee $HOME/mullvad-private-key | wg pubkey | tee $HOME/mullvad-public-key)
+# pub_key=$(wg genkey | tee $HOME/mullvad-private-key | wg pubkey | tee $HOME/mullvad-public-key)
 
 # $1    endpoint
-# $2    data
+# $2    data|GET|DELETE
 # $3    response variable
 # $4    access token (optional)
 viamv_api_request () {
@@ -98,9 +102,27 @@ viamv_api_request () {
         headers+=(-H "Authorization: Bearer $4")
     fi
 
-    local response=$(curl -sS -d $2 "${headers[@]}" https://api.mullvad.net/$1)
+    if [ -n "$2" ]; then
+        if [[ "$2" == "GET" ]]; then
+            data=""
+        elif [[ "$2" == "DELETE" ]]; then
+            data="-X DELETE"
+        else
+            data="-d $2"
+        fi
+    fi
+
+    local response=$(curl -sS $data "${headers[@]}" https://api.mullvad.net/$1)
 
     declare -g $3="$response"
+}
+
+# $1    Content to search
+# $2    Property for which to pluck value
+# $3    Name of the variable the match(es) are assigned to
+viamv_json_pluck () {
+    cut_len=$((5+${#2}))
+    declare -g $3="$(echo "$1" | grep -o -e "\"$2\":\\s*\"[^\"]\+" | cut -b $cut_len-)"
 }
 
 relays_url="https://api.mullvad.net/app/v1/relays"
@@ -160,8 +182,11 @@ else
     fi
 fi
 
+viamv_json_pluck "$relay" "ipv4_addr_in" "endpoint"
+viamv_json_pluck "$relay" "public_key" "relay_key"
+
 viamv_api_request "auth/v1/token" "{\"account_number\":\"$account_number\"}" "token_response"
-access_token=$(echo $token_response | grep -o -e "\"access_token\":\"[^\"]*" | cut -b 17-)
+viamv_json_pluck "$token_response" "access_token" "access_token"
 
 # Check if the access token is obviously not what is expected.
 # The access token is invalid if it is fewer than 10 chars or is not case-insensitive alpha-numeric + underscore.
@@ -171,16 +196,57 @@ if [ ${#access_token} -lt 10 -o $(echo -n $access_token | grep -o -e "^[a-zA-Z0-
     exit 1
 fi
 
-echo $access_token
-echo $pub_key
+viamv_api_request "accounts/v1/devices" "GET" "device_list" $access_token
 
-# Establish mullvad device registered pubkey
-viamv_api_request "accounts/v1/devices" "{\"pubkey\":\"$pub_key\",\"hijack_dns\":false}" "devices_response" $access_token
+viamv_json_pluck "$device_list" "id" "device_ids"
+device_ids=( $device_ids )
 
-echo "$devices_response"
+for device_id in ${device_ids[@]}; do
+    if [ -f "$cache_dir/$device_id.key" ]; then
+        use_device=$device_id
+        break
+    fi
+done
 
-if ($check_enabled); then
-    check_result=$(/bin/bash ./via-wireguard -k -- curl https://am.i.mullvad.net/connected)
+if [ -z "$use_device" ]; then
+    private_key=$(wg genkey)
+    public_key=$(echo "$private_key" | wg pubkey)
+
+    # Establish mullvad device registered pubkey
+    viamv_api_request "accounts/v1/devices" "{\"pubkey\":\"$public_key\",\"hijack_dns\":false}" "create_device_response" $access_token
+
+    if [[ "$create_device_response" == *"MAX_DEVICES_REACHED"* ]]; then
+        # The Mullvad account is at the limit of devices.
+        # The oldest device will be deleted.
+        if [ -n "$allow_delete_device" ]; then
+            viamv_json_pluck "$device_list" "created" "device_dates"
+            oldest_device_date=$(echo -n "$device_dates" | sort | sed '1q;d')
+            oldest_device=$(echo -n "$device_list" | grep -o -e "{[^}]*\"created\":\"$oldest_device_date\"[^}]*}")
+            viamv_json_pluck "$oldest_device" "id" "oldest_device_id"
+            viamv_api_request "accounts/v1/devices/$oldest_device_id" "DELETE" "delete_device_response" $access_token
+            viamv_api_request "accounts/v1/devices" "{\"pubkey\":\"$public_key\",\"hijack_dns\":false}" "create_device_response" $access_token
+        else
+            echo "Mullvad account is at device limit. Call via-mullvad with -f option to allow deleting the oldest device from the account"
+            exit 1
+        fi
+    fi
+
+    viamv_json_pluck "$create_device_response" "id" "use_device"
+    echo "$private_key" > "$cache_dir/$use_device.key"
+
+    viamv_json_pluck "$create_device_response" "ipv4_address" "ip"
+else
+    device=$(echo -n "$device_list" | grep -o -e "{[^}]*\"id\":\"$use_device\"[^}]*}")
+    viamv_json_pluck "$device" "ipv4_address" "ip"
 fi
 
-/bin/bash ./via-wireguard -- "$program"
+vwg_args=("$endpoint:19415" "$cache_dir/$use_device.key" "$relay_key")
+vwg_args+=(-i "$ip")
+
+if [ -n "$nameserver" ]; then
+    vwg_args+=(-r "$nameserver")
+fi
+
+vwg_args+=(-- "$program")
+
+/bin/bash ./via-wireguard ${vwg_args[@]}
